@@ -189,13 +189,7 @@ def _dedupe_boxes(boxes: List[Tuple[int, int, int, int]], iou_threshold: float =
     return kept
 
 
-def _detect_black_border_crops(
-    image: Image.Image,
-    min_area_ratio: float,
-    max_area_ratio: float,
-    border_darkness: int,
-    margin_px: int,
-) -> List[Tuple[int, int, int, int]]:
+def _detect_black_border_crops( image: Image.Image, min_area_ratio: float, max_area_ratio: float, border_darkness: int, margin_px: int, ) -> List[Tuple[int, int, int, int]]:
     arr = np.array(image)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     height, width = gray.shape[:2]
@@ -266,16 +260,7 @@ def _extract_embedded_images(pdf_path: Path, output_dir: Path, min_width: int = 
     return results
 
 
-def extract_product_images(
-    pdf_path: Path,
-    output_dir: Path,
-    dpi: int = 180,
-    min_area_ratio: float = 0.004,
-    max_area_ratio: float = 0.70,
-    border_darkness: int = 80,
-    margin_px: int = 8,
-    use_embedded_fallback: bool = True,
-) -> List[CropResult]:
+def extract_product_images( pdf_path: Path, output_dir: Path, dpi: int = 180, min_area_ratio: float = 0.004, max_area_ratio: float = 0.70, border_darkness: int = 80, margin_px: int = 8, use_embedded_fallback: bool = True, ) -> List[CropResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(str(pdf_path))
     results: List[CropResult] = []
@@ -384,12 +369,7 @@ def build_distance_table(pdf_items: Sequence[ImageFingerprint], album_items: Seq
     return pd.DataFrame(rows).sort_values("distance", ascending=True).reset_index(drop=True)
 
 
-def compare_sets(
-    pdf_items: Sequence[ImageFingerprint],
-    album_items: Sequence[ImageFingerprint],
-    match_threshold: float = 18.0,
-    doubtful_threshold: float = 30.0,
-) -> Dict[str, object]:
+def compare_sets( pdf_items: Sequence[ImageFingerprint], album_items: Sequence[ImageFingerprint], match_threshold: float = 18.0, doubtful_threshold: float = 30.0, ) -> Dict[str, object]:
     distance_table = build_distance_table(pdf_items, album_items)
     matched_pairs = []
     used_pdf = set()
@@ -507,15 +487,7 @@ def save_credentials(creds: Credentials) -> None:
 
 
 def load_credentials() -> Optional[Credentials]:
-    """
-    Carga credenciales de Google Fotos.
-
-    Prioridad:
-    1. Token guardado por la app después de OAuth normal.
-    2. GOOGLE_REFRESH_TOKEN guardado en Streamlit Secrets.
-
-    El segundo método evita problemas de redirección OAuth en Streamlit Cloud.
-    """
+    """ Carga credenciales de Google Fotos. Prioridad: 1. Token guardado por la app después de OAuth normal. 2. GOOGLE_REFRESH_TOKEN guardado en Streamlit Secrets. El segundo método evita problemas de redirección OAuth en Streamlit Cloud. """
     token_json = st.session_state.get("google_token_json")
     if not token_json and TOKEN_FILE.exists():
         token_json = TOKEN_FILE.read_text(encoding="utf-8")
@@ -1046,41 +1018,7 @@ def google_photos_tab(settings: Dict) -> None:
 def help_tab() -> None:
     st.header("3) Ayuda")
     st.markdown(
-        """
-### Esta es la versión fácil para subir desde Android
-
-Solo necesitas subir archivos sueltos a GitHub. No necesitas subir carpetas.
-
-Archivos necesarios:
-
-- `app.py`
-- `requirements.txt`
-- `README.md`
-- `secrets.example.toml`
-
-### Orden recomendado
-
-1. Sube esos archivos a GitHub.
-2. Publica la app en Streamlit Community Cloud usando `app.py` como archivo principal.
-3. Configura los secretos de Streamlit.
-4. Primero prueba la pestaña **Prueba local** con un PDF real.
-5. Después conecta Google Fotos y crea el álbum maestro.
-
-### Secretos que debes configurar en Streamlit
-
-```toml
-APP_PASSWORD = "tu_clave_privada"
-GOOGLE_CLIENT_ID = "tu_client_id"
-GOOGLE_CLIENT_SECRET = "tu_client_secret"
-GOOGLE_REDIRECT_URI = "https://tu-app.streamlit.app"
-GOOGLE_REFRESH_TOKEN = "opcional_recomendado_si_el_regreso_de_google_falla"
-MASTER_ALBUM_ID = "opcional_si_ya_tienes_el_id"
-```
-
-### Importante
-
-No subas contraseñas, claves de Google ni tokens a GitHub.
-"""
+        """ ### Esta es la versión fácil para subir desde Android Solo necesitas subir archivos sueltos a GitHub. No necesitas subir carpetas. Archivos necesarios: - `app.py` - `requirements.txt` - `README.md` - `secrets.example.toml` ### Orden recomendado 1. Sube esos archivos a GitHub. 2. Publica la app en Streamlit Community Cloud usando `app.py` como archivo principal. 3. Configura los secretos de Streamlit. 4. Primero prueba la pestaña **Prueba local** con un PDF real. 5. Después conecta Google Fotos y crea el álbum maestro. ### Secretos que debes configurar en Streamlit ```toml APP_PASSWORD = "tu_clave_privada" GOOGLE_CLIENT_ID = "tu_client_id" GOOGLE_CLIENT_SECRET = "tu_client_secret" GOOGLE_REDIRECT_URI = "https://tu-app.streamlit.app" GOOGLE_REFRESH_TOKEN = "opcional_recomendado_si_el_regreso_de_google_falla" MASTER_ALBUM_ID = "opcional_si_ya_tienes_el_id" ``` ### Importante No subas contraseñas, claves de Google ni tokens a GitHub. """
     )
 
 
