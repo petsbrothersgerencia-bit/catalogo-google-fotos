@@ -1,0 +1,2182 @@
+# -*- coding: utf-8 -*-
+"""
+FINAL: 3 CATÁLOGOS + SP SIN PRECIO + ORDEN ENCADENADO + CÓDIGO PRIMERA LÍNEA
+Autor: ChatGPT para Pets Brothers
+
+Qué conserva esta versión:
+- Tres catálogos: 4PETS BROTHERS, P3TS BROTHERS y SP.
+- Carga de PDF corregida para Android: el botón Browse files no filtra por tipo antes de recibir el archivo.
+- Extracción de códigos de producto desde texto seleccionable del PDF.
+- Asociación de cada código con la imagen que está encima.
+- Comparación por código, no solo por parecido visual.
+- Reconstrucción del álbum sin cambiar el enlace compartido.
+- Actualización: subir nuevos, retirar agotados y reemplazar existentes para actualizar precio/imagen.
+- Mantiene orden del PDF: página -> arriba-abajo -> izquierda-derecha, usando la posición de los códigos como referencia principal.
+
+Secrets esperados en Streamlit:
+APP_PASSWORD = "tu_clave"
+GOOGLE_CLIENT_ID = "..."
+GOOGLE_CLIENT_SECRET = "..."
+GOOGLE_REFRESH_TOKEN = "..."
+ALBUM_4PETS_ID = "..."
+ALBUM_4PETS_TITLE = "4PETS BROTHERS"
+ALBUM_P3TS_ID = "..."
+ALBUM_P3TS_TITLE = "P3TS BROTHERS"
+ALBUM_SP_ID = "..."
+ALBUM_SP_TITLE = "SP"
+"""
+
+import io
+import re
+import time
+import json
+import math
+import hashlib
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Iterable
+
+import requests
+import streamlit as st
+from PIL import Image, ImageOps, ImageDraw
+
+try:
+    import fitz  # PyMuPDF
+except Exception:  # pragma: no cover
+    fitz = None
+
+try:
+    import pytesseract  # OCR opcional para leer códigos en fotos manuales
+except Exception:  # pragma: no cover
+    pytesseract = None
+
+APP_VERSION = "FINAL_3_CATALOGOS_SP_ORDEN_ENCADENADO_CODIGO_PRIMERA_LINEA_2026_07_10"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+PHOTOS_API = "https://photoslibrary.googleapis.com/v1"
+BOGOTA_TZ = timezone(timedelta(hours=-5))
+
+# Modo ultra estricto para intentar conservar el orden visual en Google Fotos.
+# Es más lento, pero reduce mezclas cuando Google procesa muchas imágenes.
+GOOGLE_CREATE_DELAY_SECONDS = 1.25
+GOOGLE_REBUILD_SETTLE_SECONDS = 12
+
+CATALOGS = {
+    "4PETS": {
+        "label": "4PETS BROTHERS",
+        "album_id_secret": "ALBUM_4PETS_ID",
+        "album_title_secret": "ALBUM_4PETS_TITLE",
+        "filename_prefix": "4PETS",
+        "mode": "normal",
+    },
+    "P3TS": {
+        "label": "P3TS BROTHERS",
+        "album_id_secret": "ALBUM_P3TS_ID",
+        "album_title_secret": "ALBUM_P3TS_TITLE",
+        "filename_prefix": "P3TS",
+        "mode": "normal",
+    },
+    "SP": {
+        "label": "SP",
+        "album_id_secret": "ALBUM_SP_ID",
+        "album_title_secret": "ALBUM_SP_TITLE",
+        "filename_prefix": "SP",
+        # En SP se conserva imagen, código, descripción y QR, pero se tapa el precio.
+        "mode": "hide_price",
+    },
+}
+
+# Códigos de producto.
+# Esta versión acepta códigos alfanuméricos, solo números, solo letras y también códigos
+# con guion interno, por ejemplo: 14473-1, C14473-11, C521-8.
+# Sigue filtrando medidas como 42CM, 52CM, 69CM, 500ML, 1KG, XL, etc.
+# Importante: el guion se conserva como parte del código para que 14473-1 y 14473-2
+# no queden guardados incorrectamente como el mismo código 14473.
+CODE_TOKEN_RE = re.compile(r"(?<![A-Z0-9-])(?:[A-Z0-9]{1,16}(?:-[A-Z0-9]{1,16}){0,3})(?![A-Z0-9-])")
+# Se mantiene CODE_RE por compatibilidad con otras funciones internas.
+CODE_RE = CODE_TOKEN_RE
+MEASUREMENT_CODE_RE = re.compile(
+    r"^(?:"
+    r"\d{1,5}(?:CM|MM|M|MT|MTS|KG|G|GR|ML|L|LT|LTS|OZ|LB|PULG|IN|UND|UN|PCS|PZ|PZS)"
+    r"|(?:CM|MM|M|MT|MTS|KG|G|GR|ML|L|LT|LTS|OZ|LB|PULG|IN|UND|UN|PCS|PZ|PZS)\d{1,5}"
+    r"|XS|S|M|L|XL|XXL|XXXL)$"
+)
+DIMENSION_CODE_RE = re.compile(r"^\d+(?:[Xx×*]\d+)+(?:CM|MM|M|MT|MTS)?$")
+UNIT_WORDS = {
+    "CM", "MM", "M", "MT", "MTS", "KG", "G", "GR", "ML", "L", "LT", "LTS",
+    "OZ", "LB", "PULG", "IN", "UND", "UN", "PCS", "PZ", "PZS"
+}
+BANNED_CODE_WORDS = {
+    "4PETS", "P3TS", "PETS", "BROTHERS", "SP", "CATALOGO", "CATLOGO",
+    "PRODUCTO", "PRODUCTOS", "PRECIO", "PRECIOS", "PAGINA", "PGINA",
+    "MEDIDA", "MEDIDAS", "TALLA", "TALLAS", "COLOR", "COLORES",
+    "ANCHO", "ALTO", "LARGO", "DIAMETRO", "DIMETRO", "PESO", "CAPACIDAD",
+    "PERRO", "PERROS", "GATO", "GATOS", "MASCOTA", "MASCOTAS",
+    "JUGUETE", "JUGUETES", "COMEDERO", "COMEDEROS", "COLLAR", "COLLARES",
+    "CAMA", "CAMAS", "ASEO", "ACCESORIO", "ACCESORIOS", "ALIMENTO", "ALIMENTOS",
+    "NEGRO", "BLANCO", "ROJO", "AZUL", "VERDE", "ROSADO", "AMARILLO", "GRIS",
+    "PEQUEO", "PEQUENO", "PEQUE", "PEQUENA", "PEQUEAS", "PEQUEÑAS",
+    "MEDIANO", "MEDIANA", "MEDIANOS", "MEDIANAS", "GRANDE", "GRANDES",
+    "MOTIVO", "MOTIVOS", "RASCADOR", "RASCADORES", "DIMENSION", "DIMENSIONES",
+    "NUEVO", "NUEVA"
+}
+# Precio colombiano visible en el PDF, por ejemplo $6,900, $ 6.900 o 6900.
+PRICE_TEXT_RE = re.compile(r"^\$?\s*\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?$|^\$\s*\d{3,}$")
+
+
+@dataclass
+class TextItem:
+    text: str
+    code: str
+    rect: fitz.Rect
+    page_number: int
+    # 0 = alfanumérico normal, 1 = solo números, 2 = solo letras.
+    # Se usa para preferir códigos más confiables si hay varios textos cerca de una imagen.
+    priority: int = 0
+
+
+@dataclass
+class ProductCrop:
+    code: str
+    page_number: int
+    order_on_page: int
+    bbox_points: Tuple[float, float, float, float]
+    image_bytes: bytes
+    image_hash: str
+    filename: str
+    source: str = "PDF"
+    original_filename: str = ""
+    manual_note: str = ""
+
+
+def safe_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+        if value is None:
+            return default
+        return str(value).strip()
+    except Exception:
+        return default
+
+
+def normalize_code(value: str) -> str:
+    """Normaliza un código conservando guiones internos válidos.
+
+    Antes se eliminaban todos los caracteres que no fueran letras/números.
+    Eso convertía códigos diferentes como 14473-1, 14473-2 y 14473-3 en el mismo
+    código 14473. Ahora el guion se conserva cuando está dentro del código.
+    """
+    value = (value or "").upper().strip()
+    value = value.replace("–", "-").replace("—", "-").replace("−", "-")
+    # Corrige espacios alrededor del guion: 14473 - 1 => 14473-1
+    value = re.sub(r"\s*-\s*", "-", value)
+    value = re.sub(r"[^A-Z0-9-]", "", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value
+
+
+def code_candidate_priority(value: str) -> Optional[int]:
+    """Devuelve prioridad si el texto parece código, o None si debe ignorarse.
+
+    Reglas principales:
+    - Acepta códigos alfanuméricos: CEP32, CAM3, COL49, G886225.
+    - Acepta códigos con guion: 14473-1, C14473-11, C521-8.
+    - Acepta códigos solo numéricos: 0045, 886225, 202501.
+    - Acepta códigos solo letras: ABC, PAS, MOP.
+    - Rechaza medidas/tallas: 42CM, 52CM, 69CM, 500ML, 1KG, XL.
+    """
+    raw = (value or "").upper().strip()
+    raw_normalized_hyphen = raw.replace("–", "-").replace("—", "-").replace("−", "-")
+    raw_compact = re.sub(r"\s+", "", raw_normalized_hyphen)
+    # Si el texto original queda con guion al inicio o al final, probablemente es un
+    # código partido por el PDF/OCR. No lo aceptamos incompleto; se debe combinar con la parte vecina.
+    if raw_compact.startswith("-") or raw_compact.endswith("-"):
+        return None
+
+    code = normalize_code(raw)
+    plain = code.replace("-", "")
+
+    if not code or not plain or len(plain) < 2 or len(code) > 24:
+        return None
+    if code in BANNED_CODE_WORDS or plain in BANNED_CODE_WORDS or code in UNIT_WORDS or plain in UNIT_WORDS:
+        return None
+    if PRICE_TEXT_RE.match(raw.replace(" ", "")) or "$" in raw:
+        return None
+    if MEASUREMENT_CODE_RE.match(plain) or DIMENSION_CODE_RE.match(plain):
+        return None
+
+    # Si tiene guion, debe estar entre partes reales del código: 14473-1, C521-8.
+    if "-" in code:
+        parts = code.split("-")
+        if len(parts) < 2 or any(not part for part in parts):
+            return None
+        if any(part in UNIT_WORDS or part in BANNED_CODE_WORDS for part in parts):
+            return None
+        # Evita tomar medidas o rangos como códigos cuando alguna parte es claramente unidad.
+        if any(MEASUREMENT_CODE_RE.match(part) for part in parts):
+            return None
+        # Códigos con guion son bastante confiables porque suelen venir del código del producto.
+        return 0
+
+    has_letter = any(ch.isalpha() for ch in plain)
+    has_digit = any(ch.isdigit() for ch in plain)
+
+    if has_letter and has_digit:
+        return 0
+    if has_digit and not has_letter:
+        # Permitimos numéricos desde 3 dígitos para no perder códigos reales.
+        # Los números pegados a unidades se filtran aparte revisando palabras vecinas.
+        if 3 <= len(plain) <= 12:
+            return 1
+        return None
+    if has_letter and not has_digit:
+        # Los códigos solo letras son válidos, pero son los más riesgosos porque se parecen
+        # a palabras de descripción. Por eso se limitan a 3-8 letras y se filtran palabras comunes.
+        if 3 <= len(plain) <= 8:
+            return 2
+        return None
+    return None
+
+
+def looks_like_code(value: str) -> bool:
+    return code_candidate_priority(value) is not None
+
+
+def sanitize_filename_part(value: str) -> str:
+    value = normalize_code(value)
+    value = value or "SINCODIGO"
+    return re.sub(r"[^A-Z0-9_-]", "", value)
+
+
+def image_average_hash(image_bytes: bytes, size: int = 8) -> str:
+    """Hash visual simple, sin depender de imagehash."""
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = ImageOps.exif_transpose(im).convert("L").resize((size, size))
+        pixels = list(im.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = 0
+        for p in pixels:
+            bits = (bits << 1) | int(p >= avg)
+        return f"{bits:0{size * size // 4}x}"
+
+
+def hamming_hex(a: str, b: str) -> Optional[int]:
+    try:
+        ia = int(a, 16)
+        ib = int(b, 16)
+        return (ia ^ ib).bit_count()
+    except Exception:
+        return None
+
+
+def rect_iou(a: fitz.Rect, b: fitz.Rect) -> float:
+    inter = a & b
+    if inter.is_empty:
+        return 0.0
+    inter_area = inter.get_area()
+    union_area = a.get_area() + b.get_area() - inter_area
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def dedupe_rects(rects: List[fitz.Rect], iou_threshold: float = 0.85) -> List[fitz.Rect]:
+    result: List[fitz.Rect] = []
+    for rect in sorted(rects, key=lambda r: (round(r.y0, 1), round(r.x0, 1), -r.get_area())):
+        if any(rect_iou(rect, existing) >= iou_threshold for existing in result):
+            continue
+        result.append(rect)
+    return result
+
+
+def get_pdf_words(page) -> List[Tuple[float, float, float, float, str]]:
+    words = page.get_text("words") or []
+    clean_words = []
+    for w in words:
+        if len(w) >= 5:
+            text = str(w[4]).strip()
+            if text:
+                clean_words.append((float(w[0]), float(w[1]), float(w[2]), float(w[3]), text))
+    return clean_words
+
+
+def word_rect(word: Tuple[float, float, float, float, str]) -> fitz.Rect:
+    return fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+
+
+def words_same_line(a: Tuple[float, float, float, float, str], b: Tuple[float, float, float, float, str]) -> bool:
+    return same_text_line(word_rect(a), word_rect(b))
+
+
+def numeric_has_unit_neighbor(words: List[Tuple[float, float, float, float, str]], idx: int) -> bool:
+    """Evita tomar números de medidas como códigos cuando vienen separados: 500 ML, 42 CM."""
+    text = normalize_code(words[idx][4])
+    if not text.isdigit():
+        return False
+    for other_idx in (idx - 1, idx + 1):
+        if other_idx < 0 or other_idx >= len(words):
+            continue
+        if not words_same_line(words[idx], words[other_idx]):
+            continue
+        other = normalize_code(words[other_idx][4])
+        if other in UNIT_WORDS:
+            return True
+    return False
+
+
+def extract_code_items(page, page_number: int) -> List[TextItem]:
+    items: List[TextItem] = []
+    words = get_pdf_words(page)
+
+    def neighbor_text(idx: int) -> str:
+        if idx < 0 or idx >= len(words):
+            return ""
+        return str(words[idx][4]).upper().strip()
+
+    for word_idx, (x0, y0, x1, y1, text) in enumerate(words):
+        # Algunos PDFs parten textos con guion. Ejemplos:
+        # 14473-1 puede llegar como una sola palabra, como "14473-" + "1",
+        # o como "14473" + "-" + "1". Por eso probamos también combinaciones
+        # con las palabras vecinas de la misma línea.
+        upper = str(text).upper().strip()
+        current_rect = fitz.Rect(x0, y0, x1, y1)
+        candidates_to_check: List[Tuple[str, fitz.Rect]] = []
+
+        prev_txt = neighbor_text(word_idx - 1)
+        next_txt = neighbor_text(word_idx + 1)
+        next2_txt = neighbor_text(word_idx + 2)
+
+        next_same = word_idx + 1 < len(words) and words_same_line(words[word_idx], words[word_idx + 1])
+        next2_same = word_idx + 2 < len(words) and words_same_line(words[word_idx], words[word_idx + 2])
+        prev_same = word_idx - 1 >= 0 and words_same_line(words[word_idx], words[word_idx - 1])
+
+        # Caso normal: el código viene completo en una palabra.
+        # Si la palabra está justo pegada a un guion separado, evitamos tomar solo el prefijo.
+        is_part_of_split_hyphen_code = (
+            upper.endswith("-")
+            or upper == "-"
+            or upper.startswith("-")
+            or (next_same and next_txt == "-")
+            or (prev_same and prev_txt == "-")
+        )
+        if not is_part_of_split_hyphen_code:
+            candidates_to_check.append((upper, current_rect))
+
+        # Caso: "14473-" + "1".
+        if upper.endswith("-") and next_same and next_txt:
+            rect = current_rect | word_rect(words[word_idx + 1])
+            candidates_to_check.append((upper + next_txt, rect))
+
+        # Caso: "14473" + "-1".
+        if next_same and next_txt.startswith("-") and len(next_txt) > 1:
+            rect = current_rect | word_rect(words[word_idx + 1])
+            candidates_to_check.append((upper + next_txt, rect))
+
+        # Caso: "14473" + "-" + "1".
+        if next_same and next2_same and next_txt == "-" and next2_txt:
+            rect = current_rect | word_rect(words[word_idx + 1]) | word_rect(words[word_idx + 2])
+            candidates_to_check.append((upper + "-" + next2_txt, rect))
+
+        seen_local = set()
+        for candidate_text, candidate_rect in candidates_to_check:
+            for match in CODE_TOKEN_RE.finditer(candidate_text):
+                candidate = match.group(0)
+                code = normalize_code(candidate)
+                if code in seen_local:
+                    continue
+                seen_local.add(code)
+                priority = code_candidate_priority(candidate)
+                if priority is None:
+                    continue
+                # Evita falsos códigos cuando el PDF separa la unidad: "52 CM", "500 ML", "1 KG".
+                plain = code.replace("-", "")
+                if plain.isdigit() and "-" not in code and numeric_has_unit_neighbor(words, word_idx):
+                    continue
+                items.append(
+                    TextItem(
+                        text=candidate_text,
+                        code=code,
+                        rect=candidate_rect,
+                        page_number=page_number,
+                        priority=priority,
+                    )
+                )
+    return items
+
+
+def get_image_rects(page) -> List[fitz.Rect]:
+    rects: List[fitz.Rect] = []
+    page_rect = page.rect
+    page_area = page_rect.get_area()
+
+    # Método 1: imágenes embebidas según PyMuPDF.
+    try:
+        for info in page.get_image_info(xrefs=True):
+            bbox = info.get("bbox")
+            if not bbox:
+                continue
+            rect = fitz.Rect(bbox)
+            rects.append(rect)
+    except Exception:
+        pass
+
+    # Método 2: bloques de imagen dentro del diccionario de texto.
+    try:
+        page_dict = page.get_text("dict") or {}
+        for block in page_dict.get("blocks", []):
+            if block.get("type") == 1 and "bbox" in block:
+                rects.append(fitz.Rect(block["bbox"]))
+    except Exception:
+        pass
+
+    filtered: List[fitz.Rect] = []
+    for rect in rects:
+        if rect.is_empty:
+            continue
+        width = rect.width
+        height = rect.height
+        area = rect.get_area()
+        if width < 25 or height < 25:
+            continue
+        if area < 900:
+            continue
+        # Evita capturar un fondo de página completa como si fuera producto.
+        if page_area > 0 and area / page_area > 0.80:
+            continue
+        filtered.append(rect)
+
+    return dedupe_rects(filtered)
+
+
+def find_code_below_image(image_rect: fitz.Rect, codes: List[TextItem], used_code_indexes: set) -> Optional[Tuple[int, TextItem]]:
+    """Busca el código principal debajo de una imagen.
+
+    Regla nueva para evitar falsos códigos:
+    - El código real del catálogo normalmente es la primera palabra en negrilla
+      justo debajo de la imagen.
+    - Por eso se prioriza la primera línea de texto debajo de la imagen y el texto
+      más a la izquierda de esa línea.
+    - Se siguen rechazando medidas/tallas como 2CM, 3CM, 52CM, 68X39, 300G.
+    """
+    candidates: List[Tuple[float, float, float, int, TextItem]] = []
+    img_center_x = (image_rect.x0 + image_rect.x1) / 2
+    # El código suele estar inmediatamente debajo de la imagen; damos margen amplio
+    # para páginas donde la foto tiene espacio blanco o el recorte de imagen acaba antes.
+    max_below = max(130.0, image_rect.height * 0.95)
+    x_left_allowed = image_rect.x0 - max(35.0, image_rect.width * 0.25)
+    x_right_allowed = image_rect.x1 + max(35.0, image_rect.width * 0.25)
+
+    for idx, item in enumerate(codes):
+        if idx in used_code_indexes:
+            continue
+        code_rect = item.rect
+        code = normalize_code(item.code)
+        if not looks_like_code(code):
+            continue
+        code_plain = code.replace("-", "")
+        # Bloqueo extra de medidas que podrían llegar pegadas o separadas en el PDF.
+        if MEASUREMENT_CODE_RE.match(code_plain) or DIMENSION_CODE_RE.match(code_plain):
+            continue
+        if code in BANNED_CODE_WORDS or code_plain in BANNED_CODE_WORDS:
+            continue
+
+        # Debe estar debajo de la imagen, no en la zona de medidas/talla encima de la foto.
+        if code_rect.y0 < image_rect.y1 - 6:
+            continue
+        vertical_gap = code_rect.y0 - image_rect.y1
+        if vertical_gap > max_below:
+            continue
+
+        code_center_x = (code_rect.x0 + code_rect.x1) / 2
+        horizontal_overlap = max(0.0, min(image_rect.x1, code_rect.x1) - max(image_rect.x0, code_rect.x0))
+        inside_extended_x = (x_left_allowed <= code_center_x <= x_right_allowed) or (x_left_allowed <= code_rect.x0 <= x_right_allowed)
+        center_dist = abs(code_center_x - img_center_x)
+        center_allowed = max(image_rect.width * 0.85, 80.0)
+        if horizontal_overlap <= 0 and not inside_extended_x and center_dist > center_allowed:
+            continue
+
+        # Score: primero la línea más cercana debajo de la imagen, luego la palabra más a la izquierda,
+        # y por último la prioridad del tipo de código.
+        left_distance = max(0.0, code_rect.x0 - x_left_allowed)
+        score = vertical_gap * 100.0 + left_distance * 0.02 + item.priority * 8.0
+        candidates.append((score, vertical_gap, code_rect.x0, idx, item))
+
+    if not candidates:
+        return None
+
+    # Nos quedamos con la primera línea visual debajo de la imagen.
+    min_gap = min(c[1] for c in candidates)
+    first_line = [c for c in candidates if c[1] <= min_gap + 12.0]
+    # En esa línea escogemos el primer texto válido. Esto corrige casos como:
+    # CM02 / D.CAMA MEDIANA CM02, CM06 / D.CAMA MOTIVOS CM06, G1 / D.RASCADOR...
+    first_line.sort(key=lambda c: (c[2], c[4].priority, c[0]))
+    return first_line[0][3], first_line[0][4]
+
+def find_image_above_code(code_item: TextItem, image_rects: List[fitz.Rect], used_image_indexes: set) -> Optional[Tuple[int, fitz.Rect]]:
+    """Busca la imagen que está encima de un código.
+
+    Esta función corrige el orden del catálogo: primero se ordenan los códigos por su
+    posición visual en el PDF y después se busca la imagen asociada a cada código.
+    Así la vista previa y la subida quedan en el mismo orden del PDF, aunque el PDF
+    entregue internamente las imágenes en un orden raro.
+    """
+    candidates: List[Tuple[float, int, fitz.Rect]] = []
+    code_rect = code_item.rect
+    code_center_x = (code_rect.x0 + code_rect.x1) / 2
+
+    for idx, image_rect in enumerate(image_rects):
+        if idx in used_image_indexes:
+            continue
+        if image_rect.is_empty:
+            continue
+
+        # La imagen del producto debe estar encima del código o apenas tocándolo.
+        # Esto evita escoger QR u otras imágenes que estén abajo del bloque de texto.
+        if image_rect.y0 > code_rect.y0:
+            continue
+        vertical_gap = code_rect.y0 - image_rect.y1
+        if vertical_gap < -8:
+            continue
+        max_gap = max(90.0, image_rect.height * 0.65)
+        if vertical_gap > max_gap:
+            continue
+
+        image_center_x = (image_rect.x0 + image_rect.x1) / 2
+        center_dist = abs(code_center_x - image_center_x)
+        horizontal_overlap = max(0.0, min(image_rect.x1, code_rect.x1) - max(image_rect.x0, code_rect.x0))
+        center_allowed = max(image_rect.width * 0.70, 55.0)
+        if horizontal_overlap <= 0 and center_dist > center_allowed:
+            continue
+
+        # Preferimos la imagen más cercana encima del código y mejor alineada.
+        # Un pequeño bono por tamaño ayuda a preferir la foto principal sobre adornos.
+        area_bonus = min(image_rect.get_area() / 100000.0, 3.0)
+        score = code_item.priority * 40.0 + max(vertical_gap, 0) + center_dist * 0.035 - area_bonus
+        candidates.append((score, idx, image_rect))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1], candidates[0][2]
+
+
+def same_text_line(a: fitz.Rect, b: fitz.Rect) -> bool:
+    """Devuelve True si dos palabras están en la misma línea visual."""
+    ac = (a.y0 + a.y1) / 2
+    bc = (b.y0 + b.y1) / 2
+    tolerance = max(a.height, b.height, 6.0) * 0.75
+    return abs(ac - bc) <= tolerance
+
+
+def is_money_word(text: str) -> bool:
+    clean = (text or "").strip().replace(" ", "")
+    if "$" in clean and any(ch.isdigit() for ch in clean):
+        return True
+    return bool(PRICE_TEXT_RE.match(clean))
+
+
+def find_price_word_rects(words: List[Tuple[float, float, float, float, str]], crop_rect: fitz.Rect, code_rect: fitz.Rect) -> List[fitz.Rect]:
+    """Encuentra la zona del precio usando el texto real del PDF.
+
+    No depende del ancho del recorte. Busca palabras con $ y, si el PDF separa el $ del número,
+    también tapa el número que esté en la misma línea.
+    """
+    entries: List[Tuple[fitz.Rect, str]] = []
+    for x0, y0, x1, y1, text in words:
+        rect = fitz.Rect(x0, y0, x1, y1)
+        center = fitz.Point((x0 + x1) / 2, (y0 + y1) / 2)
+        if crop_rect.contains(center):
+            entries.append((rect, str(text).strip()))
+
+    price_rects: List[fitz.Rect] = []
+    for idx, (rect, text) in enumerate(entries):
+        clean = text.replace(" ", "")
+        # Evita borrar números dentro de la descripción: el precio normalmente está debajo del código.
+        if rect.y0 < code_rect.y1 - 2:
+            continue
+
+        # Caso normal: la palabra contiene $6,900 o $.
+        if "$" in clean:
+            line_rect = fitz.Rect(rect)
+            for other_rect, other_text in entries:
+                if other_rect == rect:
+                    continue
+                if other_rect.y0 < code_rect.y1 - 2:
+                    continue
+                if same_text_line(rect, other_rect):
+                    other_clean = other_text.replace(" ", "")
+                    # Incluye solo la parte numérica del precio, no palabras como Pres:.
+                    if is_money_word(other_clean) or (other_clean.replace(",", "").replace(".", "").isdigit() and other_rect.x0 >= rect.x0 - 2):
+                        line_rect |= other_rect
+            price_rects.append(line_rect)
+            continue
+
+        # Caso alternativo: algunos PDFs no incluyen $ en la palabra, pero dejan números tipo 6,900.
+        if is_money_word(clean):
+            # Solo tomarlo si en la misma línea o muy cerca existe un símbolo $ o la palabra Pres.
+            nearby_dollar = False
+            nearby_pres = False
+            for other_rect, other_text in entries:
+                if other_rect.y0 < code_rect.y1 - 2:
+                    continue
+                if same_text_line(rect, other_rect) or abs(other_rect.y1 - rect.y0) < max(rect.height, 8.0) * 1.8:
+                    o = other_text.strip().lower()
+                    if "$" in o:
+                        nearby_dollar = True
+                    if o.startswith("pres") or "precio" in o:
+                        nearby_pres = True
+            if nearby_dollar or nearby_pres:
+                price_rects.append(fitz.Rect(rect))
+
+    # Une rectángulos muy cercanos en la misma línea para tapar bien el precio completo.
+    merged: List[fitz.Rect] = []
+    for rect in sorted(price_rects, key=lambda r: (r.y0, r.x0)):
+        placed = False
+        for i, existing in enumerate(merged):
+            if same_text_line(rect, existing) and abs(rect.x0 - existing.x1) < 35:
+                merged[i] = existing | rect
+                placed = True
+                break
+        if not placed:
+            merged.append(rect)
+    return merged
+
+
+def cover_price_in_image(im: Image.Image, price_rects: List[fitz.Rect], crop_rect: fitz.Rect, original_render_size: Tuple[int, int], dpi: int) -> Image.Image:
+    """Tapa el precio con blanco en la imagen ya renderizada del producto."""
+    if not price_rects:
+        return im
+    zoom = dpi / 72.0
+    render_w, render_h = original_render_size
+    scale_x = im.width / max(render_w, 1)
+    scale_y = im.height / max(render_h, 1)
+    draw = ImageDraw.Draw(im)
+    for rect in price_rects:
+        x0 = int((rect.x0 - crop_rect.x0) * zoom * scale_x) - 8
+        y0 = int((rect.y0 - crop_rect.y0) * zoom * scale_y) - 6
+        x1 = int((rect.x1 - crop_rect.x0) * zoom * scale_x) + 10
+        y1 = int((rect.y1 - crop_rect.y0) * zoom * scale_y) + 8
+        x0 = max(0, min(im.width, x0))
+        y0 = max(0, min(im.height, y0))
+        x1 = max(0, min(im.width, x1))
+        y1 = max(0, min(im.height, y1))
+        if x1 > x0 and y1 > y0:
+            draw.rectangle([x0, y0, x1, y1], fill="white")
+    return im
+
+
+def crop_product_from_page(page, image_rect: fitz.Rect, code_item: TextItem, dpi: int = 180, hide_price: bool = False) -> bytes:
+    """Recorta la imagen y el texto relacionado debajo.
+
+    En modo SP (hide_price=True), mantiene código, descripción y QR, pero tapa solo el precio
+    usando la posición real del texto en el PDF.
+    """
+    words = get_pdf_words(page)
+    crop_rect = fitz.Rect(image_rect)
+    code_rect = fitz.Rect(code_item.rect)
+    crop_rect |= code_rect
+
+    img_width = max(image_rect.width, 1.0)
+    x_min_allowed = image_rect.x0 - img_width * 0.20
+    x_max_allowed = image_rect.x1 + img_width * 0.20
+    y_min_allowed = image_rect.y0 - 6
+    y_max_allowed = code_rect.y1 + max(45.0, image_rect.height * 0.20)
+
+    for x0, y0, x1, y1, text in words:
+        word_rect = fitz.Rect(x0, y0, x1, y1)
+        center_x = (x0 + x1) / 2
+        if x_min_allowed <= center_x <= x_max_allowed and y_min_allowed <= y0 <= y_max_allowed:
+            crop_rect |= word_rect
+
+    # Un poco de margen para no cortar bordes o texto.
+    pad_x = max(4.0, image_rect.width * 0.035)
+    pad_y = max(4.0, image_rect.height * 0.030)
+    crop_rect = fitz.Rect(
+        max(page.rect.x0, crop_rect.x0 - pad_x),
+        max(page.rect.y0, crop_rect.y0 - pad_y),
+        min(page.rect.x1, crop_rect.x1 + pad_x),
+        min(page.rect.y1, crop_rect.y1 + pad_y),
+    )
+
+    price_rects = find_price_word_rects(words, crop_rect, code_rect) if hide_price else []
+
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pix = page.get_pixmap(matrix=matrix, clip=crop_rect, alpha=False)
+    original_render_size = (pix.width, pix.height)
+    png_bytes = pix.tobytes("png")
+
+    with Image.open(io.BytesIO(png_bytes)) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        # Limita tamaño para que Google Fotos y Streamlit trabajen más rápido.
+        max_side = 1800
+        if max(im.size) > max_side:
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+        if hide_price:
+            im = cover_price_in_image(im, price_rects, crop_rect, original_render_size, dpi)
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=92, optimize=True)
+        return out.getvalue()
+
+def extract_products_from_pdf(pdf_bytes: bytes, catalog_key: str, dpi: int = 180) -> Tuple[List[ProductCrop], List[str]]:
+    if fitz is None:
+        raise RuntimeError("Falta PyMuPDF. En requirements.txt debe existir: PyMuPDF")
+    if not pdf_bytes or not pdf_bytes[:5] == b"%PDF-":
+        raise ValueError("El archivo no parece ser un PDF válido.")
+
+    warnings: List[str] = []
+    products: List[ProductCrop] = []
+    seen_codes: Dict[str, int] = {}
+    prefix = CATALOGS.get(catalog_key, {}).get("filename_prefix", catalog_key)
+    hide_price = CATALOGS.get(catalog_key, {}).get("mode") == "hide_price"
+
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            page_number = page_index + 1
+            image_rects = get_image_rects(page)
+            image_rects = sorted(image_rects, key=lambda r: (round(r.y0, 1), round(r.x0, 1)))
+            code_items = extract_code_items(page, page_number)
+            code_items = sorted(code_items, key=lambda item: (round(item.rect.y0, 1), round(item.rect.x0, 1), item.priority))
+
+            if not image_rects:
+                warnings.append(f"Página {page_number}: no encontré imágenes embebidas para recortar.")
+                continue
+            if not code_items:
+                warnings.append(f"Página {page_number}: no encontré códigos de producto seleccionables.")
+                continue
+
+            # Corrección de lectura de código:
+            # Ahora recorremos primero las imágenes en orden visual y buscamos el código principal
+            # debajo de cada imagen. El código real del catálogo es la primera palabra en negrilla
+            # bajo la foto; por eso evitamos tomar palabras de descripción como MEDIANA, MOTIVOS,
+            # PEQUE o RASCADOR, y también evitamos medidas como 2CM, 3CM o 68X39.
+            used_images = set()
+            used_codes = set()
+            order_on_page = 0
+            for image_idx, image_rect in enumerate(image_rects):
+                if image_idx in used_images:
+                    continue
+                matched_code = find_code_below_image(image_rect, code_items, used_codes)
+                if not matched_code:
+                    continue
+                code_idx, code_item = matched_code
+                code = normalize_code(code_item.code)
+                if not code:
+                    continue
+                used_codes.add(code_idx)
+                used_images.add(image_idx)
+
+                if code in seen_codes:
+                    warnings.append(
+                        f"Código duplicado {code}: ya apareció antes. Se conserva la primera aparición y se omite esta."
+                    )
+                    continue
+                seen_codes[code] = 1
+                try:
+                    image_bytes = crop_product_from_page(page, image_rect, code_item, dpi=dpi, hide_price=hide_price)
+                    image_hash = image_average_hash(image_bytes)
+                    global_order = len(products) + 1
+                    filename = f"{prefix}_{global_order:04d}_{sanitize_filename_part(code)}.jpg"
+                    product_bbox = tuple(float(v) for v in image_rect)
+                    products.append(
+                        ProductCrop(
+                            code=code,
+                            page_number=page_number,
+                            order_on_page=order_on_page,
+                            bbox_points=product_bbox,
+                            image_bytes=image_bytes,
+                            image_hash=image_hash,
+                            filename=filename,
+                        )
+                    )
+                    order_on_page += 1
+                except Exception as exc:
+                    warnings.append(f"Página {page_number}, código {code}: no pude recortar la imagen. Error: {exc}")
+
+            unmatched_codes = [item.code for idx, item in enumerate(code_items) if idx not in used_codes]
+            # No mostramos todos para no llenar pantalla; solo diagnóstico útil.
+            if len(unmatched_codes) > 12:
+                warnings.append(
+                    f"Página {page_number}: {len(unmatched_codes)} códigos no fueron asociados a una imagen. "
+                    "Puede ser encabezado, tabla o texto fuera de productos."
+                )
+
+    products.sort(key=lambda p: (p.page_number, p.order_on_page))
+    if not products:
+        warnings.append(
+            "No se pudo asociar ningún código con imagen. Revisa que los códigos estén debajo de cada imagen y que el PDF no sea una sola imagen escaneada."
+        )
+    return products, warnings
+
+
+def normalize_manual_image_bytes(image_bytes: bytes, max_side: int = 1800) -> bytes:
+    """Normaliza una foto manual a JPG para subirla a Google Fotos."""
+    if not image_bytes:
+        raise ValueError("La imagen está vacía.")
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        if max(im.size) > max_side:
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=92, optimize=True)
+        return out.getvalue()
+
+
+def ocr_text_from_image_bytes(image_bytes: bytes) -> str:
+    """Lee texto dentro de una foto manual usando OCR si pytesseract está disponible."""
+    if pytesseract is None:
+        raise RuntimeError(
+            "OCR no disponible. Agrega pytesseract en requirements.txt y tesseract-ocr en packages.txt."
+        )
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        # Aumenta contraste y tamaño para mejorar lectura de etiquetas pequeñas.
+        max_side = 2600
+        if max(im.size) < 1400:
+            scale = min(2.0, 1400 / max(max(im.size), 1))
+            im = im.resize((int(im.width * scale), int(im.height * scale)), Image.LANCZOS)
+        elif max(im.size) > max_side:
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+        gray = ImageOps.grayscale(im)
+        gray = ImageOps.autocontrast(gray)
+        return pytesseract.image_to_string(gray, config="--psm 6") or ""
+
+
+def detect_code_candidates_from_text(text: str, max_candidates: int = 8) -> List[str]:
+    """Detecta posibles códigos dentro del texto leído por OCR."""
+    candidates: List[Tuple[int, int, str]] = []
+    seen = set()
+    # El OCR puede leer un código como "14473 - 1". Aquí unimos esos espacios
+    # alrededor del guion para conservar el código completo.
+    text_upper = (text or "").upper().replace("–", "-").replace("—", "-").replace("−", "-")
+    # Evita que medidas separadas por espacio se vuelvan códigos numéricos: "500 ML" => no tomar "500".
+    unit_alt = r"(?:CM|MM|M|MT|MTS|KG|G|GR|ML|L|LT|LTS|OZ|LB|PULG|IN|UND|UN|PCS|PZ|PZS)"
+    text_upper = re.sub(rf"\b\d{{1,5}}\s*{unit_alt}\b", " ", text_upper)
+    text_upper = re.sub(rf"\b{unit_alt}\s*\d{{1,5}}\b", " ", text_upper)
+    text_upper = re.sub(r"(?<=[A-Z0-9])\s*-\s*(?=[A-Z0-9])", "-", text_upper)
+    for match in CODE_TOKEN_RE.finditer(text_upper):
+        raw = match.group(0)
+        code = normalize_code(raw)
+        priority = code_candidate_priority(raw)
+        if priority is None:
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        candidates.append((priority, match.start(), code))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [code for _priority, _pos, code in candidates[:max_candidates]]
+
+
+def media_item_is_manual(item: dict) -> bool:
+    """Indica si una foto del álbum fue subida manualmente desde esta app."""
+    description = (item.get("description") or "").upper()
+    return "MANUAL_UPLOAD=YES" in description or "UPLOAD_SOURCE=MANUAL" in description
+
+
+def media_items_for_code(items_by_code: Dict[str, List[dict]], code: str, preserve_manual: bool = False) -> List[dict]:
+    """Devuelve elementos de un código, opcionalmente excluyendo fotos manuales protegidas."""
+    result = []
+    for item in items_by_code.get(code, []) or []:
+        if preserve_manual and media_item_is_manual(item):
+            continue
+        result.append(item)
+    return result
+
+
+def media_item_thumbnail_url(item: dict, width: int = 180, height: int = 180) -> str:
+    """Devuelve una URL liviana de miniatura desde baseUrl de Google Fotos."""
+    base_url = (item or {}).get("baseUrl") or ""
+    if not base_url:
+        return ""
+    return f"{base_url}=w{int(width)}-h{int(height)}"
+
+
+def render_exhausted_thumbnails(exhausted_codes: List[str], by_code: Dict[str, List[dict]], max_items: int = 80):
+    """Muestra miniaturas de posibles agotados usando las imágenes actuales del álbum."""
+    if not exhausted_codes:
+        st.write("No hay posibles agotados.")
+        return
+
+    st.caption("Miniaturas tomadas del álbum actual de Google Fotos. Úsalas para confirmar visualmente qué producto salió del PDF nuevo.")
+    shown_codes = exhausted_codes[:max_items]
+    cols = st.columns(4)
+    for idx, code in enumerate(shown_codes):
+        media_items = by_code.get(code, []) or []
+        item = media_items[0] if media_items else {}
+        thumb_url = media_item_thumbnail_url(item)
+        with cols[idx % 4]:
+            if thumb_url:
+                st.image(thumb_url, caption=code, use_container_width=True)
+            else:
+                st.write(f"**{code}**")
+                st.caption("Sin miniatura disponible")
+            filename = item.get("filename", "")
+            if filename:
+                st.caption(filename[:60])
+            if len(media_items) > 1:
+                st.caption(f"{len(media_items)} imágenes con este código")
+
+    if len(exhausted_codes) > max_items:
+        st.info(f"Mostrando {max_items} de {len(exhausted_codes)} posibles agotados. Usa diagnóstico si necesitas verlos todos.")
+
+
+def get_access_token() -> str:
+    client_id = safe_secret("GOOGLE_CLIENT_ID")
+    client_secret = safe_secret("GOOGLE_CLIENT_SECRET")
+    refresh_token = safe_secret("GOOGLE_REFRESH_TOKEN")
+    missing = [name for name, val in [
+        ("GOOGLE_CLIENT_ID", client_id),
+        ("GOOGLE_CLIENT_SECRET", client_secret),
+        ("GOOGLE_REFRESH_TOKEN", refresh_token),
+    ] if not val]
+    if missing:
+        raise RuntimeError("Faltan Secrets de Google: " + ", ".join(missing))
+
+    response = requests.post(
+        GOOGLE_TOKEN_URL,
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=45,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"No pude renovar el token de Google. {response.status_code}: {response.text[:400]}")
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Google no devolvió access_token.")
+    return token
+
+
+def google_headers(token: str) -> Dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def google_json_request(method: str, url: str, token: str, **kwargs) -> dict:
+    headers = kwargs.pop("headers", {}) or {}
+    headers.update(google_headers(token))
+    response = requests.request(method, url, headers=headers, timeout=60, **kwargs)
+    if response.status_code >= 300:
+        raise RuntimeError(f"Error Google Photos {response.status_code}: {response.text[:700]}")
+    if not response.text:
+        return {}
+    try:
+        return response.json()
+    except Exception:
+        return {}
+
+
+def get_album(album_id: str, token: str) -> dict:
+    return google_json_request("GET", f"{PHOTOS_API}/albums/{album_id}", token)
+
+
+def create_google_album(title: str, token: str) -> dict:
+    """Crea un álbum desde la app para que luego la app pueda administrarlo mejor."""
+    payload = {"album": {"title": title}}
+    return google_json_request("POST", f"{PHOTOS_API}/albums", token, json=payload)
+
+
+def list_album_media(album_id: str, token: str) -> List[dict]:
+    items: List[dict] = []
+    page_token = None
+    while True:
+        payload = {"albumId": album_id, "pageSize": 100}
+        if page_token:
+            payload["pageToken"] = page_token
+        data = google_json_request("POST", f"{PHOTOS_API}/mediaItems:search", token, json=payload)
+        items.extend(data.get("mediaItems", []) or [])
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def parse_code_from_media_item(item: dict) -> Optional[str]:
+    description = item.get("description") or ""
+    match = re.search(r"APP_PRODUCT_CODE\s*=\s*([A-Z0-9-]{2,24})", description.upper())
+    if match:
+        code = normalize_code(match.group(1))
+        if looks_like_code(code):
+            return code
+
+    filename = (item.get("filename") or "").upper()
+    filename_no_ext = re.sub(r"\.[A-Z0-9]+$", "", filename)
+    tokens = re.split(r"[^A-Z0-9-]+", filename_no_ext)
+    ignored = {"4PETS", "P3TS", "SP", "BROTHERS", "CATALOGO", "PRODUCTO", "IMG", "IMAGE", "FOTO"}
+    candidates = [normalize_code(t) for t in tokens if normalize_code(t) and normalize_code(t) not in ignored]
+    candidates = [c for c in candidates if looks_like_code(c)]
+    if candidates:
+        # Normalmente el código va al final: 4PETS_CEP32.jpg.
+        return candidates[-1]
+    return None
+
+
+def parse_hash_from_media_item(item: dict) -> Optional[str]:
+    description = item.get("description") or ""
+    match = re.search(r"IMAGE_HASH\s*=\s*([0-9A-Fa-f]+)", description)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def now_update_strings() -> Tuple[str, str]:
+    """Devuelve fecha/hora de actualización en UTC y hora Colombia."""
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    now_bogota = now_utc.astimezone(BOGOTA_TZ)
+    return now_utc.isoformat(), now_bogota.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_datetime_value(value: str) -> Optional[datetime]:
+    """Convierte fechas guardadas por la app o por Google Fotos a datetime comparable."""
+    if not value:
+        return None
+    value = str(value).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BOGOTA_TZ)
+        return dt
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BOGOTA_TZ)
+    except Exception:
+        return None
+
+
+def format_bogota_datetime(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "Sin dato"
+    bogota = dt.astimezone(BOGOTA_TZ)
+    text = bogota.strftime("%Y-%m-%d %I:%M %p")
+    return text.replace("AM", "a. m.").replace("PM", "p. m.") + " (Colombia)"
+
+
+def parse_update_datetime_from_media_item(item: dict) -> Optional[datetime]:
+    """Lee la fecha registrada por la app en la descripción de cada foto.
+
+    Si una foto es vieja y todavía no tiene CATALOG_UPDATED_AT_UTC, usa como respaldo
+    la fecha de creación que devuelve Google Fotos.
+    """
+    description = item.get("description") or ""
+    for field in ("CATALOG_UPDATED_AT_UTC", "UPDATED_AT_UTC", "CREATED_AT_UTC"):
+        match = re.search(rf"{field}\s*=\s*([^\n\r]+)", description, re.IGNORECASE)
+        if match:
+            dt = parse_datetime_value(match.group(1))
+            if dt:
+                return dt
+
+    metadata = item.get("mediaMetadata") or {}
+    return parse_datetime_value(metadata.get("creationTime") or item.get("createdTime") or "")
+
+
+def latest_catalog_update_text(items: List[dict]) -> str:
+    dates = [parse_update_datetime_from_media_item(item) for item in items]
+    dates = [dt for dt in dates if dt is not None]
+    if not dates:
+        return "Sin dato"
+    return format_bogota_datetime(max(dates))
+
+
+def media_by_code(items: List[dict]) -> Tuple[Dict[str, List[dict]], List[dict]]:
+    by_code: Dict[str, List[dict]] = {}
+    without_code: List[dict] = []
+    for item in items:
+        code = parse_code_from_media_item(item)
+        if code:
+            by_code.setdefault(code, []).append(item)
+        else:
+            without_code.append(item)
+    return by_code, without_code
+
+
+def remove_media_from_album(album_id: str, media_ids: List[str], token: str, progress_label: str = "Retirando imágenes") -> int:
+    if not media_ids:
+        return 0
+    total = 0
+    progress = st.progress(0, text=progress_label)
+    chunks = [media_ids[i : i + 50] for i in range(0, len(media_ids), 50)]
+    for idx, chunk in enumerate(chunks, start=1):
+        google_json_request(
+            "POST",
+            f"{PHOTOS_API}/albums/{album_id}:batchRemoveMediaItems",
+            token,
+            json={"mediaItemIds": chunk},
+        )
+        total += len(chunk)
+        progress.progress(idx / len(chunks), text=f"{progress_label}: {total}/{len(media_ids)}")
+        time.sleep(0.15)
+    progress.empty()
+    return total
+
+
+def upload_raw_image(product: ProductCrop, token: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/octet-stream",
+        "X-Goog-Upload-File-Name": product.filename,
+        "X-Goog-Upload-Protocol": "raw",
+    }
+    response = requests.post(f"{PHOTOS_API}/uploads", headers=headers, data=product.image_bytes, timeout=90)
+    if response.status_code >= 300:
+        raise RuntimeError(f"Error subiendo {product.filename}: {response.status_code} {response.text[:400]}")
+    upload_token = response.text.strip()
+    if not upload_token:
+        raise RuntimeError(f"Google no devolvió upload token para {product.filename}")
+    return upload_token
+
+
+def product_global_order(product: ProductCrop) -> str:
+    """Extrae el número global del nombre, por ejemplo SP_0001_CODIGO.jpg."""
+    match = re.search(r"_(\d{4,6})_", product.filename or "")
+    if match:
+        return match.group(1)
+    return ""
+
+
+def product_description(product: ProductCrop, catalog_key: str, catalog_title: str) -> str:
+    source = (getattr(product, "source", "PDF") or "PDF").upper()
+    updated_at_utc, updated_at_bogota = now_update_strings()
+    lines = [
+        f"APP_PRODUCT_CODE={product.code}",
+        f"CATALOG_KEY={catalog_key}",
+        f"CATALOG_TITLE={catalog_title}",
+        f"ORDER_GLOBAL={product_global_order(product)}",
+        f"PAGE={product.page_number}",
+        f"ORDER_ON_PAGE={product.order_on_page}",
+        f"IMAGE_HASH={product.image_hash}",
+        f"UPLOAD_SOURCE={source}",
+        f"MANUAL_UPLOAD={'YES' if source == 'MANUAL' else 'NO'}",
+        f"CATALOG_UPDATED_AT_UTC={updated_at_utc}",
+        f"CATALOG_UPDATED_AT_BOGOTA={updated_at_bogota}",
+        f"APP_VERSION={APP_VERSION}",
+    ]
+    original_filename = (getattr(product, "original_filename", "") or "").replace("\n", " ").strip()
+    manual_note = (getattr(product, "manual_note", "") or "").replace("\n", " ").strip()
+    if original_filename:
+        lines.append(f"ORIGINAL_FILENAME={original_filename[:120]}")
+    if manual_note:
+        lines.append(f"MANUAL_NOTE={manual_note[:160]}")
+    return "\n".join(lines)
+
+def batch_create_media(
+    album_id: str,
+    products_with_tokens: List[Tuple[ProductCrop, str]],
+    catalog_key: str,
+    catalog_title: str,
+    token: str,
+    relative_after_media_item_id: Optional[str] = None,
+) -> Tuple[int, Optional[str]]:
+    """Crea elementos en Google Fotos y devuelve el ID del último creado.
+
+    Modo orden encadenado:
+    - el primer producto se crea al final del álbum;
+    - cada producto siguiente se intenta crear justo después del mediaItemId anterior.
+
+    Si Google no acepta la posición relativa en algún caso, upload_products_to_album()
+    puede reintentar con LAST_IN_ALBUM para no detener todo el proceso.
+    """
+    if not products_with_tokens:
+        return 0, None
+
+    new_media_items = []
+    for product, upload_token in products_with_tokens:
+        new_media_items.append(
+            {
+                "description": product_description(product, catalog_key, catalog_title),
+                "simpleMediaItem": {
+                    "fileName": product.filename,
+                    "uploadToken": upload_token,
+                },
+            }
+        )
+
+    album_position = {"position": "LAST_IN_ALBUM"}
+    if relative_after_media_item_id:
+        album_position = {
+            "position": "AFTER_MEDIA_ITEM",
+            "relativeMediaItemId": relative_after_media_item_id,
+        }
+
+    payload = {
+        "albumId": album_id,
+        "newMediaItems": new_media_items,
+        "albumPosition": album_position,
+    }
+
+    data = google_json_request("POST", f"{PHOTOS_API}/mediaItems:batchCreate", token, json=payload)
+    results = data.get("newMediaItemResults", []) or []
+    if not results:
+        names = ", ".join([p.filename for p, _ in products_with_tokens])
+        raise RuntimeError(f"Google no confirmó la creación de: {names}")
+
+    total_created = 0
+    failures = []
+    last_created_media_item_id: Optional[str] = None
+    for (product, _upload_token), result in zip(products_with_tokens, results):
+        status = result.get("status", {}) or {}
+        code = int(status.get("code", 0) or 0)
+        media_item = result.get("mediaItem") or {}
+        if code == 0 and media_item:
+            total_created += 1
+            if media_item.get("id"):
+                last_created_media_item_id = media_item.get("id")
+        else:
+            message = status.get("message") or "sin mensaje de Google"
+            failures.append(f"{product.filename}: {message}")
+
+    if failures:
+        raise RuntimeError("Google no creó correctamente estas imágenes: " + " | ".join(failures[:5]))
+
+    # Pausa intencional para darle tiempo a Google Fotos a ubicar el elemento.
+    time.sleep(GOOGLE_CREATE_DELAY_SECONDS)
+    return total_created, last_created_media_item_id
+
+
+def upload_products_to_album(album_id: str, products: List[ProductCrop], catalog_key: str, catalog_title: str, token: str, label: str = "Subiendo imágenes") -> int:
+    """Sube y crea cada imagen una por una para conservar mejor el orden del PDF.
+
+    MODO ORDEN ENCADENADO:
+    1. subir bytes del producto 0001;
+    2. crear elemento 0001 al final del álbum y guardar su mediaItemId;
+    3. subir producto 0002 después del mediaItemId de 0001;
+    4. repetir encadenando cada imagen después de la anterior.
+
+    Esto no puede garantizar el 100% de la vista visual de Google Fotos, pero es más
+    fuerte que enviar todo solo con LAST_IN_ALBUM.
+    """
+    if not products:
+        return 0
+
+    # Seguridad adicional: respeta el nombre 0001, 0002, 0003...
+    products_sorted = sorted(products, key=lambda p: (product_global_order(p) or "999999", p.page_number, p.order_on_page, p.code))
+
+    created_total = 0
+    previous_media_item_id: Optional[str] = None
+    fallback_count = 0
+    progress = st.progress(0, text=label)
+    for idx, product in enumerate(products_sorted, start=1):
+        progress.progress((idx - 1) / len(products_sorted), text=f"{label}: preparando {idx}/{len(products_sorted)} — {product.filename}")
+        upload_token = upload_raw_image(product, token)
+        try:
+            created, new_media_item_id = batch_create_media(
+                album_id,
+                [(product, upload_token)],
+                catalog_key,
+                catalog_title,
+                token,
+                relative_after_media_item_id=previous_media_item_id,
+            )
+        except Exception as exc:
+            if previous_media_item_id:
+                fallback_count += 1
+                st.warning(
+                    "Google no aceptó ubicar una imagen después de la anterior. "
+                    "La app reintentó al final del álbum para no detener la carga. "
+                    f"Detalle: {str(exc)[:180]}"
+                )
+                created, new_media_item_id = batch_create_media(
+                    album_id,
+                    [(product, upload_token)],
+                    catalog_key,
+                    catalog_title,
+                    token,
+                    relative_after_media_item_id=None,
+                )
+            else:
+                raise
+
+        created_total += created
+        if new_media_item_id:
+            previous_media_item_id = new_media_item_id
+        progress.progress(idx / len(products_sorted), text=f"{label}: creado {idx}/{len(products_sorted)} — {product.filename}")
+        # Pausa adicional corta entre productos para evitar que Google Fotos procese varios casi al mismo tiempo.
+        time.sleep(0.35)
+
+    progress.empty()
+    if fallback_count:
+        st.info(f"Orden encadenado aplicado con {fallback_count} reintentos al final del álbum.")
+    else:
+        st.success("Orden encadenado aplicado: cada imagen se creó después de la anterior.")
+    return created_total
+
+
+def render_product_preview(products: List[ProductCrop], limit: int = 12):
+    if not products:
+        return
+    st.caption(f"Vista previa de los primeros {min(limit, len(products))} productos detectados.")
+    cols = st.columns(3)
+    for idx, product in enumerate(products[:limit]):
+        with cols[idx % 3]:
+            st.image(product.image_bytes, caption=f"{product.code} — pág. {product.page_number}", use_container_width=True)
+
+
+def upload_pdf_widget(label: str, key: str) -> Optional[Tuple[bytes, str]]:
+    """Cargador robusto de PDF con memoria.
+
+    Corrección puntual para la pestaña de reconstrucción:
+    - conserva el PDF en st.session_state después de seleccionarlo;
+    - acepta PDF por firma interna %PDF aunque Android/Chrome lo entregue con tipo raro;
+    - el botón principal Browse files ya NO filtra por tipo antes de recibir el archivo;
+    - incluye un cargador alternativo por si Android/Chrome no entrega el archivo.
+    """
+    data_key = f"{key}_stored_pdf_bytes"
+    name_key = f"{key}_stored_pdf_name"
+    size_key = f"{key}_stored_pdf_size"
+    hash_key = f"{key}_stored_pdf_hash"
+
+    def persist_uploaded_pdf(uploaded) -> bool:
+        if uploaded is None:
+            return False
+        try:
+            data = uploaded.getvalue()
+            name = uploaded.name or "catalogo.pdf"
+        except Exception as exc:
+            st.error(f"No pude leer el archivo seleccionado: {exc}")
+            return False
+
+        if not data:
+            st.error("El PDF llegó vacío. Intenta seleccionarlo desde Descargas/Mis archivos, no desde Recientes.")
+            return False
+
+        is_pdf_name = name.lower().endswith(".pdf")
+        is_pdf_signature = data[:5] == b"%PDF-"
+        if not is_pdf_name and not is_pdf_signature:
+            st.error("El archivo cargado no parece PDF. Renómbralo como catalogo.pdf o selecciona el archivo correcto.")
+            return False
+
+        st.session_state[data_key] = data
+        st.session_state[name_key] = name
+        st.session_state[size_key] = len(data)
+        st.session_state[hash_key] = hashlib.sha256(data).hexdigest()
+        return True
+
+    uploaded = st.file_uploader(
+        label,
+        type=None,
+        accept_multiple_files=False,
+        key=f"{key}_pdf_picker",
+        help="Selecciona el PDF desde Archivos/Mis archivos/Descargas. Este botón no filtra por tipo para evitar el error rojo en Android.",
+    )
+    persist_uploaded_pdf(uploaded)
+
+    if st.session_state.get(data_key) is None:
+        with st.expander("Si el PDF no carga, abre este cargador alternativo"):
+            st.caption("Este segundo cargador no filtra por tipo de archivo. Úsalo si Android/Chrome pone el botón rojo y luego gris.")
+            uploaded_alt = st.file_uploader(
+                "Cargador alternativo del mismo PDF",
+                type=None,
+                accept_multiple_files=False,
+                key=f"{key}_raw_picker",
+            )
+            persist_uploaded_pdf(uploaded_alt)
+
+    stored_data = st.session_state.get(data_key)
+    stored_name = st.session_state.get(name_key, "catalogo.pdf")
+    stored_size = st.session_state.get(size_key, len(stored_data) if stored_data else 0)
+
+    if stored_data:
+        st.success(f"PDF cargado correctamente: {stored_name} ({stored_size / (1024 * 1024):.2f} MB)")
+        st.caption("PDF listo para procesar. Cargado desde el botón Browse files corregido para Android.")
+        if st.button("Limpiar PDF cargado", key=f"{key}_clear"):
+            for k in (data_key, name_key, size_key, hash_key):
+                st.session_state.pop(k, None)
+            st.rerun()
+        return stored_data, stored_name
+
+    st.caption("Todavía no hay PDF cargado en esta sección.")
+    return None
+
+def password_gate() -> bool:
+    configured_password = safe_secret("APP_PASSWORD")
+    if not configured_password:
+        st.warning("APP_PASSWORD no está configurado en Streamlit Secrets. La app queda sin clave interna.")
+        return True
+    if st.session_state.get("authenticated") is True:
+        return True
+    st.subheader("Ingreso")
+    password = st.text_input("Clave de la app", type="password")
+    if st.button("Entrar"):
+        if password == configured_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Clave incorrecta.")
+    return False
+
+
+def products_to_rows(products: List[ProductCrop], limit: Optional[int] = None) -> List[dict]:
+    rows = []
+    source = products if limit is None else products[:limit]
+    for p in source:
+        rows.append(
+            {
+                "codigo": p.code,
+                "pagina": p.page_number,
+                "orden": p.order_on_page + 1,
+                "archivo": p.filename,
+                "hash": p.image_hash,
+            }
+        )
+    return rows
+
+
+def codes_preview(codes: Iterable[str], max_items: int = 80) -> str:
+    codes = sorted(list(codes))
+    if not codes:
+        return ""
+    shown = codes[:max_items]
+    suffix = "" if len(codes) <= max_items else f" ... y {len(codes) - max_items} más"
+    return ", ".join(shown) + suffix
+
+
+def analyze_pdf_with_ui(pdf_bytes: bytes, catalog_key: str, dpi: int, session_key: str) -> Optional[List[ProductCrop]]:
+    with st.spinner("Leyendo PDF, códigos e imágenes..."):
+        try:
+            products, warnings = extract_products_from_pdf(pdf_bytes, catalog_key=catalog_key, dpi=dpi)
+        except Exception as exc:
+            st.error(f"No pude analizar el PDF: {exc}")
+            return None
+    st.session_state[session_key] = products
+    if warnings:
+        with st.expander("Advertencias de lectura del PDF"):
+            for warning in warnings[:80]:
+                st.warning(warning)
+            if len(warnings) > 80:
+                st.caption(f"Hay {len(warnings) - 80} advertencias adicionales.")
+    if products:
+        st.success(f"Productos detectados con código: {len(products)}")
+        st.caption("La tabla muestra todos los productos detectados, no solo los primeros 200.")
+        st.dataframe(products_to_rows(products), use_container_width=True, hide_index=True)
+        render_product_preview(products, limit=9)
+    else:
+        st.error("No se detectaron productos con código e imagen.")
+    return products
+
+
+def app():
+    st.set_page_config(page_title="Catálogo Google Fotos", page_icon="🐾", layout="wide")
+    st.title("FINAL: 3 CATÁLOGOS + SP + ORDEN ENCADENADO + CÓDIGO PRIMERA LÍNEA")
+    st.caption(f"Versión interna: {APP_VERSION}")
+
+    if not password_gate():
+        return
+
+    if fitz is None:
+        st.error("Falta PyMuPDF. En requirements.txt agrega: PyMuPDF")
+        return
+
+    st.sidebar.header("Catálogo")
+    catalog_key = st.sidebar.radio(
+        "Selecciona el catálogo que vas a trabajar",
+        list(CATALOGS.keys()),
+        format_func=lambda key: CATALOGS[key]["label"],
+        key="catalog_key_radio",
+    )
+    catalog_cfg = CATALOGS[catalog_key]
+    default_title = catalog_cfg["label"]
+    catalog_title = safe_secret(catalog_cfg["album_title_secret"], default_title) or default_title
+    album_id = safe_secret(catalog_cfg["album_id_secret"])
+    # Permite usar en esta sesión un álbum recién creado por la app antes de copiarlo a Secrets.
+    session_album_id = st.session_state.get(f"created_album_id_{catalog_key}", "")
+    if not album_id and session_album_id:
+        album_id = session_album_id
+
+    st.sidebar.markdown("---")
+    st.sidebar.write("**Catálogo actual:**", catalog_title)
+    if catalog_cfg.get("mode") == "hide_price":
+        st.sidebar.info("Modo SP: tapa solo el precio y conserva código, descripción y QR.")
+    st.sidebar.write("**Secret ID:**", catalog_cfg["album_id_secret"])
+    if album_id:
+        st.sidebar.success("Álbum configurado")
+        st.sidebar.code(album_id[:12] + "..." + album_id[-8:])
+    else:
+        st.sidebar.error("Falta el ID del álbum en Secrets")
+
+    dpi = st.sidebar.slider("Calidad de recorte PDF", min_value=130, max_value=240, value=180, step=10)
+
+    if st.sidebar.button("Probar conexión Google Fotos"):
+        try:
+            token = get_access_token()
+            if not album_id:
+                st.sidebar.error("No hay album_id configurado.")
+            else:
+                album = get_album(album_id, token)
+                st.sidebar.success("Google Fotos conectado")
+                st.sidebar.write(album.get("title", "Álbum sin título"))
+        except Exception as exc:
+            st.sidebar.error(str(exc))
+
+    if st.sidebar.button("Ver última actualización"):
+        try:
+            token = get_access_token()
+            if not album_id:
+                st.sidebar.error("No hay album_id configurado.")
+            else:
+                with st.spinner("Consultando última actualización del álbum..."):
+                    album_items = list_album_media(album_id, token)
+                st.sidebar.info("Última actualización: " + latest_catalog_update_text(album_items))
+        except Exception as exc:
+            st.sidebar.error(str(exc))
+
+    if not album_id:
+        st.error(
+            f"Falta configurar {catalog_cfg['album_id_secret']} en Streamlit Secrets. "
+            "Sin ese ID no se puede revisar ni reconstruir este catálogo."
+        )
+        st.info(
+            "Lo recomendado es que el álbum lo cree la app. Así la app podrá administrarlo mejor. "
+            "Después de crearlo, copia el ID en Streamlit Secrets y reinicia la app."
+        )
+        if st.button(f"Crear álbum {catalog_title} desde la app", key=f"create_album_{catalog_key}"):
+            try:
+                token = get_access_token()
+                album = create_google_album(catalog_title, token)
+                new_album_id = album.get("id", "")
+                st.session_state[f"created_album_id_{catalog_key}"] = new_album_id
+                st.success(f"Álbum creado: {album.get('title', catalog_title)}")
+                st.write("Copia este ID y pégalo en Streamlit Secrets:")
+                st.code(f'{catalog_cfg["album_id_secret"]} = "{new_album_id}"')
+                st.code(f'{catalog_cfg["album_title_secret"]} = "{catalog_title}"')
+                st.warning("Después de guardar Secrets, haz Reboot app para que quede permanente.")
+                if album.get("productUrl"):
+                    st.link_button("Abrir álbum en Google Fotos", album["productUrl"])
+                album_id = new_album_id
+            except Exception as exc:
+                st.error(f"No pude crear el álbum: {exc}")
+
+    tab_test, tab_update, tab_rebuild, tab_diag, tab_manual = st.tabs(
+        [
+            "A. Prueba local PDF",
+            "B. Revisar / actualizar por código",
+            "C. Reconstruir álbum desde PDF completo",
+            "D. Diagnóstico del álbum",
+            "E. Subir fotos manuales",
+        ]
+    )
+
+    with tab_test:
+        st.subheader("A. Prueba local de lectura del PDF")
+        st.write(
+            "Usa esta pestaña para confirmar que la app sí carga el PDF y detecta códigos debajo de las imágenes. "
+            "Aquí no se sube nada a Google Fotos."
+        )
+        loaded = upload_pdf_widget("Cargar PDF para prueba local", key=f"test_pdf_{catalog_key}")
+        if loaded:
+            pdf_bytes, pdf_name = loaded
+            if st.button("Analizar PDF localmente", key=f"analyze_test_{catalog_key}"):
+                analyze_pdf_with_ui(pdf_bytes, catalog_key, dpi, session_key=f"test_products_{catalog_key}")
+
+    with tab_update:
+        st.subheader("B. Revisar y actualizar el álbum por código")
+        st.write(
+            "Esta sección compara los códigos del PDF contra los códigos guardados en Google Fotos. "
+            "Así evita falsos nuevos o falsos agotados cuando cambia el precio o el diseño."
+        )
+        loaded = upload_pdf_widget("Cargar PDF nuevo del catálogo", key=f"update_pdf_{catalog_key}")
+        if loaded:
+            pdf_bytes, pdf_name = loaded
+            if st.button("Analizar PDF y comparar con el álbum", key=f"compare_{catalog_key}", disabled=not bool(album_id)):
+                products = analyze_pdf_with_ui(pdf_bytes, catalog_key, dpi, session_key=f"update_products_{catalog_key}")
+                if products:
+                    try:
+                        token = get_access_token()
+                        with st.spinner("Leyendo álbum de Google Fotos..."):
+                            album_items = list_album_media(album_id, token)
+                        by_code, without_code = media_by_code(album_items)
+                        pdf_by_code = {p.code: p for p in products}
+                        pdf_codes = set(pdf_by_code.keys())
+                        album_codes = set(by_code.keys())
+
+                        new_codes = sorted(pdf_codes - album_codes)
+                        active_codes = sorted(pdf_codes & album_codes)
+                        exhausted_codes = sorted(album_codes - pdf_codes)
+
+                        st.session_state[f"analysis_{catalog_key}"] = {
+                            "products": products,
+                            "pdf_by_code": pdf_by_code,
+                            "album_items": album_items,
+                            "by_code": by_code,
+                            "without_code": without_code,
+                            "new_codes": new_codes,
+                            "active_codes": active_codes,
+                            "exhausted_codes": exhausted_codes,
+                        }
+                        st.success("Comparación terminada.")
+                    except Exception as exc:
+                        st.error(f"No pude comparar contra Google Fotos: {exc}")
+
+        analysis = st.session_state.get(f"analysis_{catalog_key}")
+        if analysis:
+            new_codes = analysis["new_codes"]
+            active_codes = analysis["active_codes"]
+            exhausted_codes = analysis["exhausted_codes"]
+            without_code = analysis["without_code"]
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Nuevos reales", len(new_codes))
+            c2.metric("Siguen activos", len(active_codes))
+            c3.metric("Posibles agotados", len(exhausted_codes))
+            c4.metric("En álbum sin código", len(without_code))
+
+            with st.expander("Ver códigos nuevos"):
+                st.write(codes_preview(new_codes) or "No hay nuevos.")
+            with st.expander("Ver posibles agotados con miniaturas"):
+                render_exhausted_thumbnails(exhausted_codes, analysis["by_code"])
+            if without_code:
+                st.warning(
+                    "Hay imágenes en el álbum que no tienen código guardado. Para limpiar eso, usa la sección C: Reconstruir álbum."
+                )
+
+            st.markdown("### Ejecutar cambios en Google Fotos")
+            do_new = st.checkbox("Subir productos nuevos", value=True, key=f"do_new_{catalog_key}")
+            do_exhausted = st.checkbox(
+                "Retirar del álbum los posibles agotados",
+                value=False,
+                key=f"do_exhausted_{catalog_key}",
+                help="Solo retira del álbum las imágenes creadas/visibles para la app. No borra el álbum ni cambia el enlace.",
+            )
+            do_replace_active = st.checkbox(
+                "Reemplazar productos que siguen activos para actualizar precio/imagen",
+                value=False,
+                key=f"do_replace_active_{catalog_key}",
+                help="Úsalo cuando el PDF trae precios actualizados. Retira la imagen vieja del código y sube la nueva del PDF.",
+            )
+            preserve_manual_update = st.checkbox(
+                "Conservar fotos subidas manualmente cuando retire o reemplace",
+                value=True,
+                key=f"preserve_manual_update_{catalog_key}",
+                help="Protege fotos cargadas desde la pestaña E para que no se retiren por error durante la actualización por PDF.",
+            )
+            confirm_changes = st.checkbox(
+                "Confirmo que quiero aplicar estos cambios al álbum seleccionado",
+                value=False,
+                key=f"confirm_update_{catalog_key}",
+            )
+
+            if st.button("Aplicar actualización por código", key=f"apply_update_{catalog_key}", disabled=not confirm_changes):
+                try:
+                    token = get_access_token()
+                    pdf_by_code: Dict[str, ProductCrop] = analysis["pdf_by_code"]
+                    by_code: Dict[str, List[dict]] = analysis["by_code"]
+                    removed_count = 0
+                    uploaded_count = 0
+
+                    if do_exhausted and exhausted_codes:
+                        ids_to_remove = []
+                        for code in exhausted_codes:
+                            ids_to_remove.extend([
+                                item["id"] for item in media_items_for_code(by_code, code, preserve_manual=preserve_manual_update)
+                                if item.get("id")
+                            ])
+                        removed_count += remove_media_from_album(album_id, ids_to_remove, token, "Retirando agotados")
+
+                    if do_replace_active and active_codes:
+                        ids_to_remove = []
+                        for code in active_codes:
+                            ids_to_remove.extend([
+                                item["id"] for item in media_items_for_code(by_code, code, preserve_manual=preserve_manual_update)
+                                if item.get("id")
+                            ])
+                        removed_count += remove_media_from_album(album_id, ids_to_remove, token, "Retirando versiones anteriores")
+                        products_to_upload = [pdf_by_code[code] for code in active_codes if code in pdf_by_code]
+                        uploaded_count += upload_products_to_album(
+                            album_id,
+                            products_to_upload,
+                            catalog_key,
+                            catalog_title,
+                            token,
+                            label="Subiendo versiones actualizadas",
+                        )
+
+                    if do_new and new_codes:
+                        products_to_upload = [pdf_by_code[code] for code in new_codes if code in pdf_by_code]
+                        uploaded_count += upload_products_to_album(
+                            album_id,
+                            products_to_upload,
+                            catalog_key,
+                            catalog_title,
+                            token,
+                            label="Subiendo nuevos",
+                        )
+
+                    st.success(f"Actualización terminada. Retiradas: {removed_count}. Subidas: {uploaded_count}.")
+                    st.info("Fecha registrada de actualización: " + format_bogota_datetime(datetime.now(timezone.utc)))
+                    st.info("Vuelve a analizar para verificar el resultado actualizado.")
+                except Exception as exc:
+                    st.error(f"No pude aplicar la actualización: {exc}")
+
+        # Mejora de eficiencia: desde 4PETS o P3TS se puede actualizar SP con el mismo PDF.
+        # Seguridad comercial: NO permite actualizar P3TS con PDF de 4PETS ni 4PETS con PDF de P3TS.
+        if catalog_key in {"4PETS", "P3TS"}:
+            st.markdown("---")
+            st.markdown("### Actualizar SP con este mismo PDF")
+            st.info(
+                "Esta opción usa el PDF que acabas de cargar para actualizar solo el álbum SP. "
+                "SP se procesa sin precio, por eso sí puede salir desde un PDF de 4PETS o P3TS. "
+                "La app no permite cruzar precios entre 4PETS y P3TS."
+            )
+
+            sp_cfg = CATALOGS["SP"]
+            sp_title = safe_secret(sp_cfg["album_title_secret"], sp_cfg["label"]) or sp_cfg["label"]
+            sp_album_id = safe_secret(sp_cfg["album_id_secret"])
+            sp_analysis_key = f"analysis_SP_from_{catalog_key}"
+
+            if not sp_album_id:
+                st.error("Falta configurar ALBUM_SP_ID en Streamlit Secrets para poder actualizar SP.")
+            elif loaded:
+                pdf_bytes_sp, pdf_name_sp = loaded
+                st.caption(f"PDF disponible para SP: {pdf_name_sp}")
+                if st.button(
+                    f"Analizar este mismo PDF para SP sin precio desde {catalog_cfg['label']}",
+                    key=f"compare_sp_from_{catalog_key}",
+                ):
+                    products_sp = analyze_pdf_with_ui(
+                        pdf_bytes_sp,
+                        "SP",
+                        dpi,
+                        session_key=f"update_products_SP_from_{catalog_key}",
+                    )
+                    if products_sp:
+                        try:
+                            token = get_access_token()
+                            with st.spinner("Leyendo álbum SP de Google Fotos..."):
+                                sp_album_items = list_album_media(sp_album_id, token)
+                            sp_by_code, sp_without_code = media_by_code(sp_album_items)
+                            sp_pdf_by_code = {p.code: p for p in products_sp}
+                            sp_pdf_codes = set(sp_pdf_by_code.keys())
+                            sp_album_codes = set(sp_by_code.keys())
+
+                            st.session_state[sp_analysis_key] = {
+                                "products": products_sp,
+                                "pdf_by_code": sp_pdf_by_code,
+                                "album_items": sp_album_items,
+                                "by_code": sp_by_code,
+                                "without_code": sp_without_code,
+                                "new_codes": sorted(sp_pdf_codes - sp_album_codes),
+                                "active_codes": sorted(sp_pdf_codes & sp_album_codes),
+                                "exhausted_codes": sorted(sp_album_codes - sp_pdf_codes),
+                                "source_catalog": catalog_key,
+                                "source_pdf_name": pdf_name_sp,
+                            }
+                            st.success("Comparación de SP terminada con el mismo PDF.")
+                        except Exception as exc:
+                            st.error(f"No pude comparar SP contra Google Fotos: {exc}")
+            else:
+                st.caption("Carga primero un PDF en esta pestaña para poder reutilizarlo en SP.")
+
+            sp_analysis = st.session_state.get(sp_analysis_key)
+            if sp_analysis:
+                sp_new_codes = sp_analysis["new_codes"]
+                sp_active_codes = sp_analysis["active_codes"]
+                sp_exhausted_codes = sp_analysis["exhausted_codes"]
+                sp_without_code = sp_analysis["without_code"]
+
+                st.markdown("#### Resultado para SP")
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("Nuevos SP", len(sp_new_codes))
+                sc2.metric("Siguen activos SP", len(sp_active_codes))
+                sc3.metric("Posibles agotados SP", len(sp_exhausted_codes))
+                sc4.metric("SP sin código", len(sp_without_code))
+
+                with st.expander("Ver códigos nuevos para SP"):
+                    st.write(codes_preview(sp_new_codes) or "No hay nuevos.")
+                with st.expander("Ver posibles agotados SP con miniaturas"):
+                    render_exhausted_thumbnails(sp_exhausted_codes, sp_analysis["by_code"])
+
+                st.markdown("#### Ejecutar cambios solo en SP")
+                sp_do_new = st.checkbox("SP: subir productos nuevos", value=True, key=f"sp_do_new_from_{catalog_key}")
+                sp_do_exhausted = st.checkbox(
+                    "SP: retirar posibles agotados",
+                    value=False,
+                    key=f"sp_do_exhausted_from_{catalog_key}",
+                )
+                sp_do_replace_active = st.checkbox(
+                    "SP: reemplazar productos activos para actualizar imagen sin precio",
+                    value=False,
+                    key=f"sp_do_replace_active_from_{catalog_key}",
+                )
+                sp_preserve_manual = st.checkbox(
+                    "SP: conservar fotos subidas manualmente",
+                    value=True,
+                    key=f"sp_preserve_manual_from_{catalog_key}",
+                )
+                sp_confirm = st.checkbox(
+                    f"Confirmo que quiero aplicar estos cambios al álbum SP usando el PDF de {catalog_cfg['label']}",
+                    value=False,
+                    key=f"sp_confirm_from_{catalog_key}",
+                )
+
+                if st.button(
+                    "Aplicar actualización a SP con este mismo PDF",
+                    key=f"sp_apply_from_{catalog_key}",
+                    disabled=not sp_confirm,
+                ):
+                    try:
+                        token = get_access_token()
+                        sp_pdf_by_code: Dict[str, ProductCrop] = sp_analysis["pdf_by_code"]
+                        sp_by_code: Dict[str, List[dict]] = sp_analysis["by_code"]
+                        sp_removed_count = 0
+                        sp_uploaded_count = 0
+
+                        if sp_do_exhausted and sp_exhausted_codes:
+                            ids_to_remove = []
+                            for code in sp_exhausted_codes:
+                                ids_to_remove.extend([
+                                    item["id"] for item in media_items_for_code(sp_by_code, code, preserve_manual=sp_preserve_manual)
+                                    if item.get("id")
+                                ])
+                            sp_removed_count += remove_media_from_album(sp_album_id, ids_to_remove, token, "SP: retirando agotados")
+
+                        if sp_do_replace_active and sp_active_codes:
+                            ids_to_remove = []
+                            for code in sp_active_codes:
+                                ids_to_remove.extend([
+                                    item["id"] for item in media_items_for_code(sp_by_code, code, preserve_manual=sp_preserve_manual)
+                                    if item.get("id")
+                                ])
+                            sp_removed_count += remove_media_from_album(sp_album_id, ids_to_remove, token, "SP: retirando versiones anteriores")
+                            products_to_upload = [sp_pdf_by_code[code] for code in sp_active_codes if code in sp_pdf_by_code]
+                            sp_uploaded_count += upload_products_to_album(
+                                sp_album_id,
+                                products_to_upload,
+                                "SP",
+                                sp_title,
+                                token,
+                                label="SP: subiendo versiones actualizadas sin precio",
+                            )
+
+                        if sp_do_new and sp_new_codes:
+                            products_to_upload = [sp_pdf_by_code[code] for code in sp_new_codes if code in sp_pdf_by_code]
+                            sp_uploaded_count += upload_products_to_album(
+                                sp_album_id,
+                                products_to_upload,
+                                "SP",
+                                sp_title,
+                                token,
+                                label="SP: subiendo nuevos sin precio",
+                            )
+
+                        st.success(f"Actualización de SP terminada. Retiradas: {sp_removed_count}. Subidas: {sp_uploaded_count}.")
+                        st.info("Fecha registrada de actualización SP: " + format_bogota_datetime(datetime.now(timezone.utc)))
+                        st.info("Vuelve a analizar SP con este mismo PDF para verificar el resultado.")
+                    except Exception as exc:
+                        st.error(f"No pude aplicar la actualización a SP: {exc}")
+
+    with tab_rebuild:
+        st.subheader("C. Reconstruir álbum desde PDF completo")
+        st.warning(
+            "Esta opción conserva el mismo álbum y el mismo enlace compartido. Puede retirar del álbum las imágenes que la app puede ver/manejar "
+            "y sube de nuevo todo el PDF con códigos. Las fotos manuales se pueden conservar para no perderlas."
+        )
+        st.info("Botón corregido: este cargador acepta el archivo primero y luego verifica si es PDF. Así evitamos que Android/Chrome lo rechace antes de cargar.")
+        loaded = upload_pdf_widget("Cargar PDF completo para reconstruir el álbum", key=f"rebuild_pdf_{catalog_key}")
+        if loaded:
+            pdf_bytes, pdf_name = loaded
+            if st.button("Analizar PDF para reconstrucción", key=f"analyze_rebuild_{catalog_key}"):
+                analyze_pdf_with_ui(pdf_bytes, catalog_key, dpi, session_key=f"rebuild_products_{catalog_key}")
+
+        products = st.session_state.get(f"rebuild_products_{catalog_key}")
+        if products:
+            st.info(f"Listo para reconstruir {catalog_title} con {len(products)} productos detectados.")
+            confirm_rebuild_1 = st.checkbox(
+                "Entiendo que se retirarán del álbum las imágenes antiguas visibles para la app",
+                value=False,
+                key=f"confirm_rebuild_1_{catalog_key}",
+            )
+            confirm_rebuild_2 = st.checkbox(
+                "Entiendo que el álbum se conserva y el enlace compartido no cambia",
+                value=False,
+                key=f"confirm_rebuild_2_{catalog_key}",
+            )
+            preserve_manual_rebuild = st.checkbox(
+                "Conservar fotos subidas manualmente",
+                value=True,
+                key=f"preserve_manual_rebuild_{catalog_key}",
+                help="Recomendado. Las fotos cargadas en la pestaña E no se retiran durante la reconstrucción desde PDF.",
+            )
+            if st.button(
+                f"Reconstruir álbum {catalog_title} desde PDF completo",
+                key=f"run_rebuild_{catalog_key}",
+                disabled=not (confirm_rebuild_1 and confirm_rebuild_2 and bool(album_id)),
+            ):
+                try:
+                    token = get_access_token()
+                    with st.spinner("Leyendo elementos actuales del álbum..."):
+                        album_items = list_album_media(album_id, token)
+                    manual_preserved = [item for item in album_items if preserve_manual_rebuild and media_item_is_manual(item)]
+                    ids_to_remove = [
+                        item["id"] for item in album_items
+                        if item.get("id") and not (preserve_manual_rebuild and media_item_is_manual(item))
+                    ]
+                    removed = remove_media_from_album(album_id, ids_to_remove, token, "Limpiando álbum")
+                    if manual_preserved:
+                        st.info(f"Fotos manuales conservadas en el álbum: {len(manual_preserved)}")
+
+                    if ids_to_remove:
+                        wait_box = st.empty()
+                        wait_bar = st.progress(0, text="Esperando que Google Fotos termine de limpiar el álbum...")
+                        for second in range(GOOGLE_REBUILD_SETTLE_SECONDS):
+                            wait_bar.progress(
+                                (second + 1) / GOOGLE_REBUILD_SETTLE_SECONDS,
+                                text=f"Esperando limpieza de Google Fotos: {second + 1}/{GOOGLE_REBUILD_SETTLE_SECONDS} segundos",
+                            )
+                            time.sleep(1)
+                        wait_bar.empty()
+                        wait_box.empty()
+
+                    created = upload_products_to_album(
+                        album_id,
+                        products,
+                        catalog_key,
+                        catalog_title,
+                        token,
+                        label="Subiendo catálogo completo en orden ultra estricto",
+                    )
+                    st.success(
+                        f"Reconstrucción terminada. Imágenes retiradas del álbum: {removed}. Imágenes subidas: {created}."
+                    )
+                    st.info("Fecha registrada de actualización: " + format_bogota_datetime(datetime.now(timezone.utc)))
+                    st.info(
+                        "Si había fotos o videos subidos manualmente directamente en Google Fotos, pueden seguir en el álbum porque la app quizá no puede verlos."
+                    )
+                except Exception as exc:
+                    st.error(f"No pude reconstruir el álbum: {exc}")
+
+    with tab_diag:
+        st.subheader("D. Diagnóstico del álbum")
+        st.write("Sirve para confirmar si el álbum actual tiene códigos guardados por la app.")
+        if st.button("Leer diagnóstico del álbum", key=f"diag_{catalog_key}", disabled=not bool(album_id)):
+            try:
+                token = get_access_token()
+                album = get_album(album_id, token)
+                items = list_album_media(album_id, token)
+                by_code, without_code = media_by_code(items)
+                st.success("Álbum leído correctamente")
+                st.write("**Título Google Fotos:**", album.get("title", ""))
+                st.write("**ID del álbum:**")
+                st.code(album_id)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Elementos visibles para la app", len(items))
+                c2.metric("Códigos detectados", len(by_code))
+                c3.metric("Elementos sin código", len(without_code))
+                st.info("**Última actualización detectada:** " + latest_catalog_update_text(items))
+                rows = []
+                for code, media_items in sorted(by_code.items()):
+                    hashes = [parse_hash_from_media_item(item) for item in media_items]
+                    rows.append(
+                        {
+                            "codigo": code,
+                            "cantidad_en_album": len(media_items),
+                            "archivo_1": media_items[0].get("filename", ""),
+                            "hash_1": hashes[0] or "",
+                            "ultima_actualizacion_1": latest_catalog_update_text([media_items[0]]),
+                        }
+                    )
+                if rows:
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
+                if without_code:
+                    with st.expander("Elementos visibles sin código"):
+                        st.dataframe(
+                            [
+                                {"archivo": item.get("filename", ""), "id": item.get("id", "")[:12] + "..."}
+                                for item in without_code[:200]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+            except Exception as exc:
+                st.error(f"No pude leer el diagnóstico: {exc}")
+
+
+    with tab_manual:
+        st.subheader("E. Subir fotos manuales")
+        st.write(
+            "Aquí puedes subir una o varias fotos JPG/PNG. La app intentará leer el código dentro de cada foto con OCR, "
+            "pero antes de subirlas te mostrará los códigos para que los apruebes o corrijas."
+        )
+        st.info(
+            "Recomendación: toma la foto con el código visible en la etiqueta, empaque o en un papel pequeño al lado del producto. "
+            "Si el OCR no detecta el código, puedes escribirlo manualmente antes de subir."
+        )
+        if pytesseract is None:
+            st.warning(
+                "OCR no está activo en este despliegue. La pestaña sigue funcionando, pero tendrás que escribir o corregir los códigos manualmente. "
+                "Para activar lectura automática, agrega pytesseract en requirements.txt y tesseract-ocr en packages.txt."
+            )
+
+        manual_key = f"manual_items_{catalog_key}"
+        uploaded_images = st.file_uploader(
+            "Selecciona una o varias fotos manuales",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key=f"manual_photo_picker_{catalog_key}",
+            help="Puedes seleccionar varias fotos al tiempo. La app las revisa antes de subirlas.",
+        )
+
+        if uploaded_images:
+            st.caption(f"Fotos seleccionadas: {len(uploaded_images)}")
+            if st.button("Leer códigos de las fotos", key=f"read_manual_codes_{catalog_key}"):
+                manual_items = []
+                ocr_errors = []
+                for uploaded in uploaded_images:
+                    try:
+                        raw_bytes = uploaded.getvalue()
+                        image_bytes = normalize_manual_image_bytes(raw_bytes)
+                        image_hash = image_average_hash(image_bytes)
+                        ocr_text = ""
+                        candidates: List[str] = []
+                        if pytesseract is not None:
+                            try:
+                                ocr_text = ocr_text_from_image_bytes(image_bytes)
+                                candidates = detect_code_candidates_from_text(ocr_text)
+                            except Exception as exc:
+                                ocr_errors.append(f"{uploaded.name}: {exc}")
+                        manual_items.append(
+                            {
+                                "name": uploaded.name or "foto_manual.jpg",
+                                "image_bytes": image_bytes,
+                                "image_hash": image_hash,
+                                "ocr_text": ocr_text,
+                                "candidates": candidates,
+                                "detected_code": candidates[0] if candidates else "",
+                            }
+                        )
+                    except Exception as exc:
+                        st.error(f"No pude preparar {uploaded.name}: {exc}")
+                st.session_state[manual_key] = manual_items
+                if manual_items:
+                    st.success(f"Fotos preparadas para revisión: {len(manual_items)}")
+                if ocr_errors:
+                    with st.expander("Errores o advertencias del OCR"):
+                        for msg in ocr_errors[:50]:
+                            st.warning(msg)
+
+        manual_items = st.session_state.get(manual_key, []) or []
+        if manual_items:
+            st.markdown("### Revisar y corregir antes de subir")
+            st.caption("La app NO sube nada hasta que confirmes. Corrige cualquier código que esté vacío o mal leído.")
+
+            approved_count = 0
+            for idx, item in enumerate(manual_items):
+                st.markdown("---")
+                col_img, col_info, col_code = st.columns([1.1, 1.6, 1.4])
+                with col_img:
+                    st.image(item["image_bytes"], caption=item.get("name", "foto"), use_container_width=True)
+                with col_info:
+                    st.write("**Archivo:**", item.get("name", ""))
+                    candidates = item.get("candidates", []) or []
+                    if candidates:
+                        st.success("Candidatos detectados: " + ", ".join(candidates))
+                    else:
+                        st.warning("No detecté código automáticamente.")
+                    if item.get("ocr_text"):
+                        with st.expander("Ver texto leído por OCR"):
+                            st.text(item.get("ocr_text", "")[:1500])
+                with col_code:
+                    default_code = item.get("detected_code", "")
+                    code_input = st.text_input(
+                        "Código aprobado/corregido",
+                        value=default_code,
+                        key=f"manual_code_input_{catalog_key}_{idx}",
+                    )
+                    normalized = normalize_code(code_input)
+                    valid = looks_like_code(normalized)
+                    if normalized and not valid:
+                        st.error("Ese texto no parece código válido o parece una medida/talla.")
+                    elif normalized:
+                        st.success(f"Código listo: {normalized}")
+                    else:
+                        st.info("Escribe el código para esta foto.")
+                    approve = st.checkbox(
+                        "Aprobar esta foto",
+                        value=bool(normalized and valid),
+                        key=f"manual_approve_{catalog_key}_{idx}",
+                    )
+                    item["approved_code"] = normalized
+                    item["approved"] = bool(approve and normalized and valid)
+                    if item["approved"]:
+                        approved_count += 1
+
+            st.markdown("---")
+            st.write(f"**Fotos aprobadas para subir:** {approved_count} de {len(manual_items)}")
+            replace_existing_manual = st.checkbox(
+                "Reemplazar en el álbum las fotos existentes con el mismo código",
+                value=True,
+                key=f"manual_replace_existing_{catalog_key}",
+                help="Si el código ya existe, retira la versión anterior del álbum y sube esta foto manual.",
+            )
+            confirm_manual_upload = st.checkbox(
+                "Confirmo que quiero subir las fotos aprobadas al álbum seleccionado",
+                value=False,
+                key=f"manual_confirm_upload_{catalog_key}",
+            )
+            if st.button(
+                "Subir fotos manuales aprobadas",
+                key=f"manual_upload_button_{catalog_key}",
+                disabled=not (confirm_manual_upload and approved_count > 0 and bool(album_id)),
+            ):
+                try:
+                    approved_items = [item for item in manual_items if item.get("approved")]
+                    if not approved_items:
+                        st.error("No hay fotos aprobadas para subir.")
+                        return
+                    token = get_access_token()
+                    removed = 0
+                    if replace_existing_manual:
+                        with st.spinner("Buscando códigos existentes en el álbum..."):
+                            album_items = list_album_media(album_id, token)
+                        by_code, _without_code = media_by_code(album_items)
+                        ids_to_remove = []
+                        for item in approved_items:
+                            code = item.get("approved_code", "")
+                            ids_to_remove.extend([
+                                media_item["id"] for media_item in by_code.get(code, []) if media_item.get("id")
+                            ])
+                        removed = remove_media_from_album(album_id, ids_to_remove, token, "Retirando versiones anteriores")
+
+                    prefix = catalog_cfg.get("filename_prefix", catalog_key)
+                    stamp = time.strftime("%Y%m%d_%H%M%S")
+                    products_to_upload: List[ProductCrop] = []
+                    for idx, item in enumerate(approved_items, start=1):
+                        code = item.get("approved_code", "")
+                        filename = f"{prefix}_MANUAL_{stamp}_{idx:03d}_{sanitize_filename_part(code)}.jpg"
+                        products_to_upload.append(
+                            ProductCrop(
+                                code=code,
+                                page_number=0,
+                                order_on_page=idx - 1,
+                                bbox_points=(0.0, 0.0, 0.0, 0.0),
+                                image_bytes=item["image_bytes"],
+                                image_hash=item["image_hash"],
+                                filename=filename,
+                                source="MANUAL",
+                                original_filename=item.get("name", ""),
+                                manual_note="Foto subida manualmente desde la app",
+                            )
+                        )
+                    created = upload_products_to_album(
+                        album_id,
+                        products_to_upload,
+                        catalog_key,
+                        catalog_title,
+                        token,
+                        label="Subiendo fotos manuales",
+                    )
+                    st.success(f"Carga manual terminada. Retiradas: {removed}. Subidas: {created}.")
+                    st.info("Fecha registrada de actualización: " + format_bogota_datetime(datetime.now(timezone.utc)))
+                    st.info("Estas fotos quedan marcadas internamente como MANUAL_UPLOAD=YES para poder protegerlas en reconstrucciones.")
+                except Exception as exc:
+                    st.error(f"No pude subir las fotos manuales: {exc}")
+
+    st.markdown("---")
+    st.caption(
+        "Regla de trabajo: las fotos de productos que la app debe controlar deben entrar por la app. "
+        "Ahora puedes subir fotos manuales desde la pestaña E para que queden marcadas y protegidas por la app."
+    )
+
+
+if __name__ == "__main__":
+    app()
